@@ -180,26 +180,423 @@ Resources:
       SubnetId: !Ref PublicSubnet0
       Description: Interface
       GroupSet: 
-      - !Ref InstanceSecurityGroup
+      - !Ref rInstanceSecurityGroup
       SourceDestCheck: true
       Tags:
         -
           Key: Network
           Value: Control
 
+
+
+  rVpnGatewayWaitHandle: 
+   Type: AWS::CloudFormation::WaitConditionHandle
+
+
+
+  rLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties: 
+      LaunchTemplateName: !Sub '${AWS::StackName}template'
+      LaunchTemplateData: 
+        InstanceType: t3.micro
+        ImageId: !Ref LatestAmiId
+        IamInstanceProfile: 
+          Arn: !GetAtt rInstanceProfile.Arn
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            DeleteOnTermination: true
+            Description: !Sub '${AWS::StackName}-NetworkInt'
+            Groups:
+              - !Ref rInstanceSecurityGroup
+            AssociatePublicIpAddress: true
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash -xe
+            yum install -y aws-cfn-bootstrap
+
+            /opt/aws/bin/cfn-init -v \
+                --stack ${AWS::StackName} \
+                --resource rLaunchTemplate \
+                --configsets All \
+                --region ${AWS::Region}
+
+            /opt/aws/bin/cfn-signal -e $? \
+                '${rVpnGatewayWaitHandle}'
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          All:
+            - 01-ConfigureCloudWatchMetrics
+            - 02-ConfigureCloudWatchLogsAgent
+            - 03-InstallEpel
+            - 04-ConfigureVpnGateway
+        01-ConfigureCloudWatchMetrics:
+          packages:
+            yum:
+              perl-Switch: []
+              perl-DateTime: []
+              perl-Sys-Syslog: []
+              perl-LWP-Protocol-https: []
+              perl-Digest-SHA.x86_64: []
+          sources:
+            /home/ec2-user: >-
+              https://aws-cloudwatch.s3.amazonaws.com/downloads/CloudWatchMonitoringScripts-1.2.2.zip
+          files:
+            /home/ec2-user/crontab:
+              content: !Sub |
+                */1 * * * * ~/aws-scripts-mon/mon-put-instance-data.pl --aws-iam-role=${rRole} --mem-used --memory-units=megabytes --mem-util --disk-space-util --disk-space-used --disk-space-avail --disk-path=/
+              mode: '000600'
+              owner: ec2-user
+              group: ec2-user
+          commands:
+            01-yum-update:
+              command: yum update -y
+            02-monitoring-cron:
+              command: >-
+                chmod +x /home/ec2-user/aws-scripts-mon/*.pl && crontab -u
+                ec2-user /home/ec2-user/crontab && rm /home/ec2-user/crontab
+        02-ConfigureCloudWatchLogsAgent:
+          packages:
+            yum:
+              awslogs: []
+          files:
+            /etc/awslogs/awslogs.conf:
+              content: !Sub |
+                [general]
+                state_file= /var/awslogs/state/agent-state
+
+                [/var/log/cloud-init.log]
+                file = /var/log/cloud-init.log
+                log_group_name = ${rCloudWatchLogsAgentGroup}
+                log_stream_name = {instance_id}/cloud-init.log
+                datetime_format =
+
+                [/var/log/cloud-init-output.log]
+                file = /var/log/cloud-init-output.log
+                log_group_name = ${rCloudWatchLogsAgentGroup}
+                log_stream_name = {instance_id}/cloud-init-output.log
+                datetime_format =
+
+                [/var/log/cfn-init.log]
+                file = /var/log/cfn-init.log
+                log_group_name = ${rCloudWatchLogsAgentGroup}
+                log_stream_name = {instance_id}/cfn-init.log
+                datetime_format =
+
+                [/var/log/cfn-wire.log]
+                file = /var/log/cfn-wire.log
+                log_group_name = ${rCloudWatchLogsAgentGroup}
+                log_stream_name = {instance_id}/cfn-wire.log
+                datetime_format =
+
+                [/var/log/charon.log]
+                file = /var/log/charon.log
+                log_group_name = ${rCloudWatchLogsAgentGroup}
+                log_stream_name = {instance_id}/charon.log
+                datetime_format =
+
+                [/var/log/quagga/zebra.log]
+                file = /var/log/quagga/zebra.log
+                log_group_name = ${rCloudWatchLogsAgentGroup}
+                log_stream_name = {instance_id}/zebra.log
+                datetime_format =
+
+                [/var/log/quagga/bgpd.log]
+                file = /var/log/quagga/bgpd.log
+                log_group_name = ${rCloudWatchLogsAgentGroup}
+                log_stream_name = {instance_id}/bgpd.log
+                datetime_format =
+              mode: '000444'
+              owner: root
+              group: root
+            /etc/awslogs/awscli.conf:
+              content: !Sub |
+                [plugins]
+                cwlogs = cwlogs
+                [default]
+                region = ${AWS::Region}
+              mode: '000444'
+              owner: root
+              group: root
+          commands:
+            01-create-awslogs-state-file:
+              command: mkdir -p /var/awslogs/state
+            02-enable-awslogsd:
+              command: systemctl enable awslogsd.service
+            03-start-awslogsd:
+              command: systemctl start awslogsd
+        03-InstallEpel:
+          commands:
+            01-install-epel:
+              command: amazon-linux-extras install epel -y
+        04-ConfigureVpnGateway:
+          packages:
+            yum:
+              strongswan: []
+              ntp: []
+              quagga: []
+          files:
+            /etc/strongswan/strongswan.conf:
+              content: |
+                # strongswan.conf - strongSwan configuration file
+                #
+                # Refer to the strongswan.conf(5) manpage for details
+                #
+                # Configuration changes should be made in the included files
+                charon {
+                  plugins {
+                    include strongswan.d/charon/*.conf
+                  }
+                  load_modular = yes
+                  filelog {
+                    charon {
+                      path = /var/log/charon.log
+                      time_format = %b %e %T
+                      ike_name = yes
+                      append = yes
+                    }
+                  }
+                }
+              mode: '000600'
+              owner: root
+              group: root
+            /etc/strongswan/ipsec.conf:
+              content: !Sub |
+                conn %default
+                  leftauth=psk
+                  rightauth=psk
+                  ike=aes256-sha256-modp2048s256,aes128-sha1-modp1024!
+                  ikelifetime=28800s
+                  aggressive=no
+                  esp=aes128-sha256-modp2048s256,aes128-sha1-modp1024!
+                  lifetime=3600s
+                  type=tunnel
+                  dpddelay=10s
+                  dpdtimeout=30s
+                  keyexchange=ikev1
+                  rekey=yes
+                  reauth=no
+                  dpdaction=restart
+                  closeaction=restart
+                  left=%defaultroute
+                  leftsubnet=0.0.0.0/0,::/0
+                  rightsubnet=0.0.0.0/0,::/0
+                  leftupdown=/etc/strongswan/ipsec-vti.sh
+                  installpolicy=yes
+                  compress=no
+                  mobike=no
+
+                conn AWS-VPC-TUNNEL-1
+                  left=%any
+                  right=XXXpTunnel1VgwOutsideIpAddress
+                  auto=start
+                  mark=100
+
+                conn AWS-VPC-TUNNEL-2
+                  left=%any
+                  right=XXXpTunnel2VgwOutsideIpAddress
+                  auto=start
+                  mark=200
+              mode: '000600'
+              owner: root
+              group: root
+            /etc/strongswan/ipsec-vti.sh:
+              content: !Sub |
+                #!/bin/bash
+                
+                #@ /etc/strongswan/ipsec-vti.sh (Centos) or /etc/strongswan.d/ipsec-vti.sh (Ubuntu)
+                
+                # AWS VPC Hardware VPN Strongswan updown Script
+                
+                # Usage Instructions:
+                # Add "install_routes = no" to /etc/strongswan/strongswan.d/charon.conf or /etc/strongswan.d/charon.conf
+                # Add "install_virtual_ip = no" to /etc/strongswan/strongswan.d/charon.conf or /etc/strongswan.d/charon.conf
+                # For Ubuntu: Add "leftupdown=/etc/strongswan.d/ipsec-vti.sh" to /etc/ipsec.conf
+                # For RHEL/Centos: Add "leftupdown=/etc/strongswan/ipsec-vti.sh" to /etc/strongswan/ipsec.conf
+                # For RHEL/Centos 6 and below: git clone git://git.kernel.org/pub/scm/linux/kernel/git/shemminger/iproute2.git && cd iproute2 && make && cp ./ip/ip /usr/local/sbin/ip
+                
+                # Adjust the below according to the Generic Gateway Configuration file provided to you by AWS.
+                # Sample: http://docs.aws.amazon.com/AmazonVPC/latest/NetworkAdminGuide/GenericConfig.html
+                
+                IP=$(which ip)
+                IPTABLES=$(which iptables)
+                
+                PLUTO_MARK_OUT_ARR=(${!PLUTO_MARK_OUT//// })
+                PLUTO_MARK_IN_ARR=(${!PLUTO_MARK_IN//// })
+                case "$PLUTO_CONNECTION" in
+                  AWS-VPC-TUNNEL-1)
+                    VTI_INTERFACE=vti1
+                    VTI_LOCALADDR=XXXpTunnel1CgwInsideCidr
+                    VTI_REMOTEADDR=XXXpTunnel1VgwInsideCidr
+                    ;;
+                  AWS-VPC-TUNNEL-2)
+                    VTI_INTERFACE=vti2
+                    VTI_LOCALADDR=XXXpTunnel2CgwInsideCidr
+                    VTI_REMOTEADDR=XXXpTunnel2VgwInsideCidr
+                    ;;
+                esac
+                
+                case "${!PLUTO_VERB}" in
+                    up-client)
+                        #$IP tunnel add ${!VTI_INTERFACE} mode vti local ${!PLUTO_ME} remote ${!PLUTO_PEER} okey ${!PLUTO_MARK_OUT_ARR[0]} ikey ${!PLUTO_MARK_IN_ARR[0]}
+                        $IP link add ${!VTI_INTERFACE} type vti local ${!PLUTO_ME} remote ${!PLUTO_PEER} okey ${!PLUTO_MARK_OUT_ARR[0]} ikey ${!PLUTO_MARK_IN_ARR[0]}
+                        sysctl -w net.ipv4.conf.${!VTI_INTERFACE}.disable_policy=1
+                        sysctl -w net.ipv4.conf.${!VTI_INTERFACE}.rp_filter=2 || sysctl -w net.ipv4.conf.${!VTI_INTERFACE}.rp_filter=0
+                        $IP addr add ${!VTI_LOCALADDR} remote ${!VTI_REMOTEADDR} dev ${!VTI_INTERFACE}
+                        $IP link set ${!VTI_INTERFACE} up mtu 1436
+                	      $IPTABLES -t mangle -I FORWARD -o ${!VTI_INTERFACE} -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+                        $IPTABLES -t mangle -I INPUT -p esp -s ${!PLUTO_PEER} -d ${!PLUTO_ME} -j MARK --set-xmark ${!PLUTO_MARK_IN}
+                        $IP route flush table 220
+                        #/etc/init.d/bgpd reload || /etc/init.d/quagga force-reload bgpd
+                        ;;
+                    down-client)
+                        #$IP tunnel del ${!VTI_INTERFACE}
+                        $IP link del ${!VTI_INTERFACE}
+                	      $IPTABLES -t mangle -D FORWARD -o ${!VTI_INTERFACE} -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+                        $IPTABLES -t mangle -D INPUT -p esp -s ${!PLUTO_PEER} -d ${!PLUTO_ME} -j MARK --set-xmark ${!PLUTO_MARK_IN}
+                        ;;
+                esac
+              mode: '000700'
+              owner: root
+              group: root
+            /etc/strongswan/ipsec.secrets:
+              content: !Sub |
+                XXXpTunnel1VgwOutsideIpAddress : PSK "XXXpTunnel1Psk"
+                XXXpTunnel2VgwOutsideIpAddress : PSK "XXXpTunnel2Psk"
+              mode: '000600'
+              owner: root
+              group: root
+            /etc/quagga/zebra.conf:
+              content: |
+                hostname {HOSTNAME}
+                password zebra
+                enable password zebra
+                !
+                log file /var/log/quagga/zebra.log
+                !
+                ! Configure interfaces
+                interface lo
+                ! Change preferred source ip address of received routes
+                route-map RM_SET_SRC permit 10
+                  set src {PRIVATE_IP}
+                ip protocol bgp route-map RM_SET_SRC
+                !
+                line vty
+              mode: '000600'
+              owner: quagga
+              group: quagga
+            /etc/quagga/bgpd.conf:
+              content: !Sub |
+                hostname bgpd
+                password zebra
+                enable password zebra
+                !
+                log file /var/log/quagga/bgpd.log
+                !
+                debug bgp events
+                debug bgp filters
+                debug bgp fsm
+                debug bgp keepalives
+                debug bgp updates
+                !
+                router bgp XXXpLocalBgpAsn
+                  bgp router-id {PRIVATE_IP} 
+                  network XXXpVpcCidr
+                  neighbor XXXpTunnel1BgpNeighborIpAddress remote-as XXXpTunnel1BgpAsn}
+                  neighbor XXXpTunnel2BgpNeighborIpAddress remote-as XXXpTunnel2BgpAsn}
+                  neighbor XXXpTunnel2BgpNeighborIpAddress route-map RM_LOWER_PRIORITY out
+                !
+                route-map RM_LOWER_PRIORITY permit 10
+                  set as-path prepend XXXpLocalBgpAsn XXXpLocalBgpAsn XXXpLocalBgpAsn
+                !
+                line vty
+              mode: '000600'
+              owner: quagga
+              group: quagga
+            /etc/sysctl.conf:
+              content: |
+                # sysctl settings are defined through files in
+                # /usr/lib/sysctl.d/, /run/sysctl.d/, and /etc/sysctl.d/.
+                #
+                # Vendors settings live in /usr/lib/sysctl.d/.
+                # To override a whole file, create a new file with the same in
+                # /etc/sysctl.d/ and put new settings there. To override
+                # only specific settings, add a file with a lexically later
+                # name in /etc/sysctl.d/ and put new settings there.
+                #
+                # For more information, see sysctl.conf(5) and sysctl.d(5).
+                
+                net.ipv4.ip_forward = 1
+                net.ipv4.conf.all.send_redirects = 0
+                net.ipv4.conf.default.send_redirects = 0
+                net.ipv4.tcp_max_syn_backlog = 1280
+                net.ipv4.icmp_echo_ignore_broadcasts = 1
+                net.ipv4.conf.all.accept_source_route = 0
+                net.ipv4.conf.all.accept_redirects = 0
+                net.ipv4.conf.all.secure_redirects = 0
+                net.ipv4.conf.all.log_martians = 1
+                net.ipv4.conf.default.accept_source_route = 0
+                net.ipv4.conf.default.accept_redirects = 0
+                net.ipv4.conf.default.secure_redirects = 0
+                net.ipv4.icmp_echo_ignore_broadcasts = 1
+                net.ipv4.icmp_ignore_bogus_error_responses = 1
+                net.ipv4.tcp_syncookies = 1
+                net.ipv4.conf.all.rp_filter = 1
+                net.ipv4.conf.default.rp_filter = 1
+                net.ipv4.tcp_mtu_probing = 1
+              mode: '000600'
+              owner: root
+              group: root
+          commands:
+            00-sed-instance-specific-settings:
+              command: >- 
+                ipaddr=$(curl 169.254.169.254/latest/meta-data/local-ipv4) &&
+                sed -i -e "s/{PRIVATE_IP}/${ipaddr}/" /etc/quagga/zebra.conf && 
+                sed -i -e "s/{PRIVATE_IP}/${ipaddr}/" /etc/quagga/bgpd.conf && 
+                hostname=$(curl 169.254.169.254/latest/meta-data/local-hostname) &&
+                sed -i -e "s/{HOSTNAME}/${hostname}/" /etc/quagga/zebra.conf
+            01-load-sysctl-changes:
+              command: sysctl -p /etc/sysctl.conf
+            02-enable-ip-forwarding:
+              command: >- 
+                sysctl -w net.ipv4.ip_forward=1 && 
+                sysctl -w net.ipv4.conf.eth0.disable_xfrm=1 && 
+                sysctl -w net.ipv4.conf.eth0.disable_policy=1
+            03-enable-start-ntpd:
+              command: >- 
+                systemctl enable ntpd && 
+                systemctl start  ntpd
+            04-enable-start-strongswan:
+              command: >- 
+                systemctl enable strongswan && 
+                systemctl start  strongswan
+            05-enable-start-zebra:
+              command: >- 
+                systemctl enable zebra && 
+                systemctl start  zebra
+            06-enable-start-bgpd:
+              command: >- 
+                systemctl enable bgpd && 
+                systemctl start  bgpd
+
   Ec2Instance:
     Type: 'AWS::EC2::Instance'
     Properties:
       KeyName: !Ref KeyName
+      LaunchTemplate:
+        LaunchTemplateId:
+          Ref: rLaunchTemplate
+        Version:
+          Fn::GetAtt:
+            [ rLaunchTemplate, LatestVersionNumber ]
       NetworkInterfaces:
-        -
-          NetworkInterfaceId: !Ref Xface
-          DeviceIndex: 0
-      ImageId: !Ref LatestAmiId
-      InstanceType: t3.micro
-      IamInstanceProfile: !Ref rInstanceProfile
+        - DeviceIndex: '0'
+          SubnetId: !Ref PublicSubnet0
+      SourceDestCheck: false
 
-  InstanceSecurityGroup:
+
+  rInstanceSecurityGroup:
     Type: 'AWS::EC2::SecurityGroup'
     Properties:
       VpcId: !Ref VPC
@@ -231,6 +628,24 @@ Resources:
             Principal:
               Service: ec2.amazonaws.com
             Action: sts:AssumeRole
+      Policies: # Tells that you can call for the secret value
+        - PolicyName: "Secret"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "secretsmanager:GetSecretValue"
+                Resource: 
+                  - !Ref PreShared1
+                  - !Ref PreShared2
+        PolicyName: "VPN"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "ec2:DescribeVpnConnections"
+                Resource: 
+                  - !Ref myVPNConnection
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
         - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
@@ -259,6 +674,7 @@ Resources:
     Type: AWS::SecretsManager::Secret
     Properties:
       Description: 'This is the secret for BGP Session node1'
+      Name : !Sub "${AWS::StackName}-PreShared1"
       GenerateSecretString:
         SecretStringTemplate: '{"fake": "fake"}'
         GenerateStringKey: 'preshared'
@@ -269,7 +685,8 @@ Resources:
   PreShared2:
     Type: AWS::SecretsManager::Secret
     Properties:
-      Description: 'This is the secret for BGP Session node1'
+      Description: 'This is the secret for BGP Session node2'
+      Name : !Sub "${AWS::StackName}-PreShared2"
       GenerateSecretString:
         SecretStringTemplate: '{"fake": "fake"}'
         GenerateStringKey: 'preshared'
@@ -297,6 +714,12 @@ Resources:
         !Ref VPC
       VpnGatewayId: 
         !Ref myVPNGateway
+
+  rCloudWatchLogsAgentGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/${AWS::StackName}/ec2/'
+      RetentionInDays: 1
 
 Outputs:
   InstanceId:
@@ -327,3 +750,7 @@ Outputs:
     Description: IP address of the EIP
     Value: !Ref IPAddress
 
+
+
+
+# xmllint --xpath "string(//vpn_connection/ipsec_tunnel[0]/customer_gateway/tunnel_outside_address/ip_address)" plop.xml
