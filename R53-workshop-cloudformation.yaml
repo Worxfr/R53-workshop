@@ -255,10 +255,21 @@ Resources:
       Type: ipsec.1
 
 
-  PreShared:
+  PreShared1:
     Type: AWS::SecretsManager::Secret
     Properties:
-      Description: 'This is the secret for BGP Session'
+      Description: 'This is the secret for BGP Session node1'
+      GenerateSecretString:
+        SecretStringTemplate: '{"fake": "fake"}'
+        GenerateStringKey: 'preshared'
+        PasswordLength: 16
+        ExcludeCharacters: '"@/\0'
+        ExcludePunctuation: True
+
+  PreShared2:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: 'This is the secret for BGP Session node1'
       GenerateSecretString:
         SecretStringTemplate: '{"fake": "fake"}'
         GenerateStringKey: 'preshared'
@@ -276,8 +287,8 @@ Resources:
       VpnGatewayId: 
         !Ref myVPNGateway
       VpnTunnelOptionsSpecifications: 
-        - PreSharedKey: "testtesttest1"
-        - PreSharedKey: "testtesttest2"
+        - PreSharedKey: !Join ['', ['{{resolve:secretsmanager:', !Ref PreShared1, ':SecretString:preshared}}' ]]
+        - PreSharedKey: !Join ['', ['{{resolve:secretsmanager:', !Ref PreShared2, ':SecretString:preshared}}' ]]
 
   AttachVpnGateway:
     Type: AWS::EC2::VPCGatewayAttachment
